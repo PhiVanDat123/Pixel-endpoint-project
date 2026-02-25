@@ -8,17 +8,17 @@ HTTP server nhận request mô tả pixel của ảnh, chạy trên 2 EC2 instan
 Client
   ↓
 c5.xlarge:8000 (Nginx - Load Balancer)
-  ↓                    ↓
-c5.xlarge:8001      t2.xlarge:8000
-(uvicorn app)       (uvicorn app)
+  ↓                         ↓
+c5.xlarge:8001           t2.xlarge:8000
+(gunicorn × 9 workers)   (gunicorn × 9 workers)
 ```
 
 ## Thông tin máy chủ
 
-| Instance | Type | Vai trò | Host |
-|----------|------|---------|------|
-| c5 | c5.xlarge | Load Balancer + App | ec2-3-235-128-192.compute-1.amazonaws.com |
-| t2 | t2.xlarge | App | ec2-54-160-220-199.compute-1.amazonaws.com |
+| Instance | Type   | Vai trò              | Host                                        |
+|----------|--------|----------------------|---------------------------------------------|
+| c5       | c5.xlarge | Load Balancer + App | ec2-3-235-128-192.compute-1.amazonaws.com   |
+| t2       | t2.xlarge | App                 | ec2-54-160-220-199.compute-1.amazonaws.com  |
 
 **Public endpoint duy nhất:**
 ```
@@ -33,14 +33,11 @@ http://ec2-3-235-128-192.compute-1.amazonaws.com:8000/pixel
 pixel-server/
 ├── main.py              # FastAPI app
 ├── requirements.txt     # Python dependencies
-├── nginx/
-│   └── pixel.conf       # Nginx load balancer config
-├── test/
-│   └── run_test.sh      # Script test throughput
+├── gunicorn_config.py   # Gunicorn production config
+├── nginx.conf           # Nginx full config (thay thế /etc/nginx/nginx.conf)
+├── test.sh              # Script test throughput
 └── README.md
 ```
-
----
 
 ## API Endpoints
 
@@ -57,12 +54,12 @@ Nhận request mô tả 1 pixel.
 }
 ```
 
-| Field | Type | Mô tả |
-|-------|------|-------|
-| x | int | Toạ độ x |
-| y | int | Toạ độ y |
-| channel | string | R, G, hoặc B |
-| value | int | Giá trị pixel (0-255) |
+| Field   | Type   | Mô tả                    |
+|---------|--------|--------------------------|
+| x       | int    | Toạ độ x                 |
+| y       | int    | Toạ độ y                 |
+| channel | string | R, G, hoặc B             |
+| value   | int    | Giá trị pixel (0–255)    |
 
 **Response:**
 ```json
@@ -72,32 +69,13 @@ Nhận request mô tả 1 pixel.
 ### GET /pixels
 Trả về toàn bộ pixel đã nhận.
 
-**Response:**
-```json
-{
-  "total": 3000,
-  "data": [
-    {"x": 1, "y": 2, "channel": "R", "value": 128},
-    ...
-  ]
-}
-```
+> ⚠️ Lưu ý: mỗi worker có store riêng trong RAM. Kết quả từ endpoint này chỉ phản ánh dữ liệu của worker đang xử lý request đó, không phải tổng hợp toàn bộ.
 
 ### DELETE /pixels
-Xóa toàn bộ pixel đã lưu.
-
-**Response:**
-```json
-{"status": "cleared"}
-```
+Xóa toàn bộ pixel đã lưu (trong worker hiện tại).
 
 ### GET /health
-Health check endpoint.
-
-**Response:**
-```json
-{"status": "healthy"}
-```
+Health check — trả lời thẳng từ Nginx, không qua app.
 
 ---
 
@@ -120,38 +98,56 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Chạy app trên t2 (port 8000, bind private IP)
+### 2. Cài và chạy Redis trên c5 (chỉ c5)
+
+Redis chạy trên c5, cả 2 app server đều ghi vào đây.
+
+```bash
+sudo apt install redis-server -y
+
+# Cho phép kết nối từ t2 (thêm private IP của c5 vào bind)
+sudo nano /etc/redis/redis.conf
+# Sửa dòng: bind 127.0.0.1 → bind 127.0.0.1 <private-IP-c5>
+
+sudo systemctl restart redis
+sudo systemctl enable redis
+
+# Kiểm tra
+redis-cli ping   # → PONG
+```
+
+### 3. Chạy app trên t2 (port 8000)
 
 ```bash
 source venv/bin/activate
-uvicorn main:app --host 172.31.25.176 --port 8000 &
+# Trỏ REDIS_URL về private IP của c5
+REDIS_URL=redis://<private-IP-c5>:6379 gunicorn main:app -c gunicorn_config.py --bind <private-IP-t2>:8000
 ```
 
-> Thay `172.31.25.176` bằng private IP của t2 (`hostname -I`)
-
-### 3. Chạy app trên c5 (port 8001)
+### 4. Chạy app trên c5 (port 8001)
 
 ```bash
 source venv/bin/activate
-uvicorn main:app --host 0.0.0.0 --port 8001 &
+REDIS_URL=redis://127.0.0.1:6379 gunicorn main:app -c gunicorn_config.py --bind 0.0.0.0:8001
 ```
 
-### 4. Cài và cấu hình Nginx trên c5
+### 5. Cấu hình Nginx trên c5
 
 ```bash
 sudo apt install nginx -y
 
-# Copy config
-sudo cp nginx/pixel.conf /etc/nginx/sites-available/pixel
-sudo ln -s /etc/nginx/sites-available/pixel /etc/nginx/sites-enabled/
-sudo rm /etc/nginx/sites-enabled/default
+# Thay toàn bộ nginx.conf (không dùng sites-available)
+sudo cp nginx.conf /etc/nginx/nginx.conf
+
+# Sửa private IP của t2 nếu khác 172.31.25.176
+sudo nano /etc/nginx/nginx.conf
 
 # Kiểm tra và restart
 sudo nginx -t
 sudo systemctl restart nginx
 ```
 
-> Sửa private IP của t2 trong `nginx/pixel.conf` nếu khác `172.31.25.176`
+> **Lưu ý:** File `nginx.conf` này thay thế `/etc/nginx/nginx.conf` hoàn toàn, không dùng `sites-available/sites-enabled` nữa.
 
 ---
 
@@ -164,33 +160,32 @@ wget https://github.com/tsenart/vegeta/releases/download/v12.11.1/vegeta_12.11.1
 tar -zxvf vegeta_12.11.1_linux_amd64.tar.gz
 ```
 
-### Test thủ công từng level
+### Chạy script test tự động (100 → 5000 req/s)
+
+```bash
+chmod +x test.sh
+./test.sh
+```
+
+### Test thủ công 1 level
 
 ```bash
 echo '{"x":1,"y":2,"channel":"R","value":128}' > body.json
 
-# 100 req/s
 echo "POST http://ec2-3-235-128-192.compute-1.amazonaws.com:8000/pixel" | \
-  ./vegeta attack -rate=100 -duration=30s \
+  ./vegeta attack -rate=1000 -duration=30s \
     -header="Content-Type: application/json" \
-    -body=body.json | \
+    -body=body.json \
+    -workers=50 | \
   ./vegeta report
 ```
 
-### Chạy script test tự động (100 → 5000 req/s)
+### Xem / xóa data
 
 ```bash
-chmod +x test/run_test.sh
-./test/run_test.sh
-```
-
-### Xem data đã lưu
-
-```bash
+# Xem
 curl http://ec2-3-235-128-192.compute-1.amazonaws.com:8000/pixels
-```
 
-### Xóa data
-
-```bash
+# Xóa
 curl -X DELETE http://ec2-3-235-128-192.compute-1.amazonaws.com:8000/pixels
+```
