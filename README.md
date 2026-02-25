@@ -39,10 +39,37 @@ pixel-server/
 └── README.md
 ```
 
+---
+
+## Những cải tiến so với phiên bản cũ
+
+### 1. `asyncio.Lock` thay `threading.Lock`
+FastAPI chạy trên async event loop — dùng `threading.Lock()` sẽ block toàn bộ event loop khi có contention. `asyncio.Lock()` suspend coroutine mà không block thread, giúp event loop tiếp tục xử lý request khác trong lúc chờ lock.
+
+### 2. Multi-worker với Gunicorn
+Trước đây chạy `uvicorn` single process, bỏ phí toàn bộ CPU còn lại. Giờ dùng `gunicorn` với `2 × vCPU + 1` workers:
+- c5.xlarge (4 vCPU) → 9 workers
+- t2.xlarge (4 vCPU) → 9 workers
+- Tổng: ~18 workers xử lý song song
+
+### 3. Nginx keepalive upstream
+Thêm `keepalive 128` cho upstream block — Nginx giữ sẵn 128 persistent TCP connection tới các app server, loại bỏ overhead TCP handshake mỗi request. Đây là cải tiến lớn nhất về latency ở high throughput.
+
+### 4. `proxy_http_version 1.1` + `reuseport`
+HTTP/1.1 bắt buộc để keepalive hoạt động. `reuseport` cho phép mỗi Nginx worker tự accept connection, giảm lock contention trong kernel.
+
+### 5. `orjson` thay `json` mặc định
+`ORJSONResponse` nhanh hơn 3–10x so với JSONResponse mặc định của FastAPI, đặc biệt khi trả về danh sách lớn từ `GET /pixels`.
+
+### 6. `/health` endpoint trả lời thẳng từ Nginx
+Không forward lên upstream, giảm tải cho app server và loại bỏ latency.
+
+---
+
 ## API Endpoints
 
 ### POST /pixel
-Nhận request mô tả 1 pixel.
+Nhận request mô tả 1 pixel, lưu vào Redis.
 
 **Request body:**
 ```json
@@ -54,28 +81,76 @@ Nhận request mô tả 1 pixel.
 }
 ```
 
-| Field   | Type   | Mô tả                    |
-|---------|--------|--------------------------|
-| x       | int    | Toạ độ x                 |
-| y       | int    | Toạ độ y                 |
-| channel | string | R, G, hoặc B             |
-| value   | int    | Giá trị pixel (0–255)    |
+| Field   | Type   | Mô tả                 |
+|---------|--------|-----------------------|
+| x       | int    | Toạ độ x              |
+| y       | int    | Toạ độ y              |
+| channel | string | R, G, hoặc B          |
+| value   | int    | Giá trị pixel (0–255) |
 
 **Response:**
 ```json
 {"status": "ok"}
 ```
 
-### GET /pixels
-Trả về toàn bộ pixel đã nhận.
+**curl:**
+```bash
+curl -X POST http://ec2-3-235-128-192.compute-1.amazonaws.com:8000/pixel \
+  -H "Content-Type: application/json" \
+  -d '{"x":10,"y":20,"channel":"R","value":128}'
+```
 
-> ⚠️ Lưu ý: mỗi worker có store riêng trong RAM. Kết quả từ endpoint này chỉ phản ánh dữ liệu của worker đang xử lý request đó, không phải tổng hợp toàn bộ.
+---
+
+### GET /pixels
+Trả về toàn bộ pixel đã nhận từ Redis (shared across tất cả workers).
+
+**Response:**
+```json
+{
+  "total": 3,
+  "data": [
+    {"x": 1, "y": 2, "channel": "R", "value": 128},
+    {"x": 3, "y": 4, "channel": "G", "value": 200},
+    {"x": 5, "y": 6, "channel": "B", "value": 55}
+  ]
+}
+```
+
+**curl:**
+```bash
+curl http://ec2-3-235-128-192.compute-1.amazonaws.com:8000/pixels
+```
+
+---
 
 ### DELETE /pixels
-Xóa toàn bộ pixel đã lưu (trong worker hiện tại).
+Xóa toàn bộ pixel đã lưu trong Redis.
+
+**Response:**
+```json
+{"status": "cleared"}
+```
+
+**curl:**
+```bash
+curl -X DELETE http://ec2-3-235-128-192.compute-1.amazonaws.com:8000/pixels
+```
+
+---
 
 ### GET /health
 Health check — trả lời thẳng từ Nginx, không qua app.
+
+**Response:**
+```json
+{"status": "healthy", "pid": 1234, "store_size": 100}
+```
+
+**curl:**
+```bash
+curl http://ec2-3-235-128-192.compute-1.amazonaws.com:8000/health
+```
 
 ---
 
@@ -121,7 +196,7 @@ redis-cli ping   # → PONG
 ```bash
 source venv/bin/activate
 # Trỏ REDIS_URL về private IP của c5
-REDIS_URL=redis://<private-IP-c5>:6379 gunicorn main:app -c gunicorn_config.py --bind <private-IP-t2>:8000
+REDIS_URL=redis://172.31.6.171:6379 gunicorn main:app -c gunicorn_config.py --bind 172.31.25.176:8000
 ```
 
 ### 4. Chạy app trên c5 (port 8001)
