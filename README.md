@@ -41,31 +41,6 @@ pixel-server/
 
 ---
 
-## Những cải tiến so với phiên bản cũ
-
-### 1. `asyncio.Lock` thay `threading.Lock`
-FastAPI chạy trên async event loop — dùng `threading.Lock()` sẽ block toàn bộ event loop khi có contention. `asyncio.Lock()` suspend coroutine mà không block thread, giúp event loop tiếp tục xử lý request khác trong lúc chờ lock.
-
-### 2. Multi-worker với Gunicorn
-Trước đây chạy `uvicorn` single process, bỏ phí toàn bộ CPU còn lại. Giờ dùng `gunicorn` với `2 × vCPU + 1` workers:
-- c5.xlarge (4 vCPU) → 9 workers
-- t2.xlarge (4 vCPU) → 9 workers
-- Tổng: ~18 workers xử lý song song
-
-### 3. Nginx keepalive upstream
-Thêm `keepalive 128` cho upstream block — Nginx giữ sẵn 128 persistent TCP connection tới các app server, loại bỏ overhead TCP handshake mỗi request. Đây là cải tiến lớn nhất về latency ở high throughput.
-
-### 4. `proxy_http_version 1.1` + `reuseport`
-HTTP/1.1 bắt buộc để keepalive hoạt động. `reuseport` cho phép mỗi Nginx worker tự accept connection, giảm lock contention trong kernel.
-
-### 5. `orjson` thay `json` mặc định
-`ORJSONResponse` nhanh hơn 3–10x so với JSONResponse mặc định của FastAPI, đặc biệt khi trả về danh sách lớn từ `GET /pixels`.
-
-### 6. `/health` endpoint trả lời thẳng từ Nginx
-Không forward lên upstream, giảm tải cho app server và loại bỏ latency.
-
----
-
 ## API Endpoints
 
 ### POST /pixel
